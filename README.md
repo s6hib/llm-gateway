@@ -19,6 +19,20 @@ Still to come:
 
 It is written in Go with the standard library. The first caller will be [fineprint](https://github.com/s6hib/fineprint).
 
+## Deployed
+
+The gateway runs at `https://llm-g8way.fly.dev`, on one small machine on Fly.io. `GET /healthz` answers without a key. Everything else needs one.
+
+The machine stops when no requests are coming in and starts again on the next one, so the first request after a quiet spell waits for it to start. The rate limit, the cache and the stats are kept in memory and start empty each time. The day's spend is kept on a disk and is not lost.
+
+To run a copy of your own on Fly.io, put `ANTHROPIC_API_KEY`, `GATEWAY_KEYS` and `ADMIN_KEY` in a `.env` file, change `app` in `fly.toml` to a name of your own, and run:
+
+```sh
+fly launch --no-deploy --copy-config --ha=false
+fly secrets import --stage < .env
+fly deploy --ha=false
+```
+
 ## Try it
 
 You need Go 1.27.4 or newer. The tests and the commands below use a fake upstream, so they need no API key and call nothing outside your machine.
