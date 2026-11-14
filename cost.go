@@ -58,9 +58,24 @@ type usage struct {
 	} `json:"server_tool_use"`
 }
 
+// cacheWrites is the tokens written to the 5-minute and to the 1-hour cache.
+// The answer gives a total and, usually, a split of it. Whatever part of the
+// total the split does not account for is charged at the 5-minute price, the
+// API's default cache lifetime, so a split that is missing or out of date
+// cannot leave tokens uncharged.
+func (u usage) cacheWrites() (fiveMinute, oneHour int64) {
+	total := max(0, u.CacheCreationInputTokens)
+	if u.CacheCreation != nil {
+		oneHour = max(0, u.CacheCreation.Ephemeral1h)
+		total = max(total, oneHour+max(0, u.CacheCreation.Ephemeral5m))
+	}
+	return total - oneHour, oneHour
+}
+
 // promptTokens is the whole prompt: the three input counts never overlap.
 func (u usage) promptTokens() int64 {
-	return u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	fiveMinute, oneHour := u.cacheWrites()
+	return max(0, u.InputTokens) + max(0, u.CacheReadInputTokens) + fiveMinute + oneHour
 }
 
 // priceFor finds a model's price. known is false when the model is not in the
@@ -100,12 +115,7 @@ func cost(model string, u usage) int64 {
 		p.output *= haikuLongFactor
 	}
 
-	// Without the split, cache writes are charged at the 5-minute price,
-	// which is the API's default cache lifetime.
-	write5m, write1h := u.CacheCreationInputTokens, int64(0)
-	if u.CacheCreation != nil {
-		write5m, write1h = max(0, u.CacheCreation.Ephemeral5m), max(0, u.CacheCreation.Ephemeral1h)
-	}
+	write5m, write1h := u.cacheWrites()
 
 	micro := float64(u.InputTokens)*p.input +
 		float64(write5m)*p.input*cacheWrite5m +

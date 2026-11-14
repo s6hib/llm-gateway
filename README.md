@@ -9,10 +9,10 @@ What works so far:
 - Each key has a rate limit, 60 requests a minute unless you change it. A caller over the limit gets a 429 with a `Retry-After` header.
 - When the API is overloaded, rate limited, erroring or unreachable, the gateway tries again, twice by default, waiting longer each time. If the API has not started answering after 60 seconds, that try counts as failed.
 - After each answer it reads the token counts, works out what the call cost, and adds that to the caller's total for the day. A caller that reaches its daily dollar cap gets a 429 until the next day starts.
+- A request with `"stream": true` is streamed: each piece of the answer goes to the caller as it arrives, and the token counts are read out of the stream as it passes.
 
 Still to come:
 
-- streaming. For now a request with `"stream": true` gets a 400.
 - a cache for identical repeated requests
 - a load test against a fake upstream, with the numbers published here
 
@@ -74,7 +74,26 @@ Totals are kept per key and per day in `SPEND_FILE`, in millionths of a dollar:
 }
 ```
 
-The file is read at startup, so a restart does not reset the totals. The cap is checked before a call is sent and the cost is known only after it, so a key can finish the day over its cap by the calls that were already running when it got there. Failed calls are not counted. If a successful answer has no token counts the gateway can read, the caller gets a 502 in its place, so an answer is never handed over uncounted.
+The file is read at startup, so a restart does not reset the totals. The cap is checked before a call is sent and the cost is known only after it, so a key can finish the day over its cap by the calls that were already running when it got there. Failed calls are not counted. If a successful plain answer has no token counts the gateway can read, the caller gets a 502 in its place, so an answer is never handed over uncounted.
+
+## Streaming
+
+A streamed answer is a series of events. The gateway passes them on unchanged and reads two kinds as they go by: `message_start`, which names the model and the input tokens, and `message_delta`, which carries the running token counts. When the stream ends, the last counts it saw are what the call is charged for.
+
+The final counts come at the end of a stream, and they include things the caller never sees go by, such as thinking tokens. So if the caller hangs up partway, or stops reading, the gateway stops sending but keeps reading the stream to its end, for up to 5 minutes, and charges for the whole answer. The same goes for a plain answer that has already started.
+
+If a stream breaks off without its final counts, the gateway estimates the output from the amount of answer that did go by, at 3 bytes a token.
+
+The timeout is on the wait for the stream to start. Once it has started, the gateway does not cut it off.
+
+To see a stream, start the fake upstream and the gateway as above and add `"stream": true` to the request:
+
+```sh
+curl -sN http://127.0.0.1:8080/v1/messages \
+  -H 'x-api-key: demo-key-0123456789' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-haiku-5-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
 
 ## Retries
 

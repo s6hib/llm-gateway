@@ -34,9 +34,10 @@ import (
 // is held in memory, so this is kept far below what the upstream accepts.
 const maxBody = 10 << 20 // 10 MB
 
-// maxAnswer is the largest upstream answer the gateway will read. An answer
-// is held in memory too, so that its token counts can be read before it is
-// sent on.
+// maxAnswer is the largest plain upstream answer the gateway will read. A
+// plain answer is held in memory too, so that its token counts can be read
+// before it is sent on. A streamed answer is passed on piece by piece and has
+// no such limit.
 const maxAnswer = 32 << 20 // 32 MB
 
 // hopHeaders describe one connection between two machines. A proxy does not
@@ -55,6 +56,14 @@ type gateway struct {
 
 	maxRetries int
 	sleep      func(context.Context, time.Duration) error // swapped out in tests
+
+	// Tests shorten these two.
+	writeTimeout time.Duration // how long one write of an answer may take to reach the caller
+	drainLimit   time.Duration // how long to keep reading an answer after the caller has gone
+
+	// trace, when set, is told as a call passes certain points. Only tests
+	// set it, to act at an exact moment without guessing at timing.
+	trace func(point string)
 
 	spend    *spendStore
 	dailyCap int64 // millionths of a dollar, per caller per UTC day
@@ -112,26 +121,16 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A streamed answer carries its token counts in a different form, which
-	// the gateway cannot read yet. Letting one through would be spending that
-	// is never counted, so anything that is not plainly "no streaming" is
-	// refused: a body that is not a JSON object, or a stream field, in any
-	// spelling, set to something other than false or null.
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "the request body must be a JSON object")
-		return
-	}
-	for field, value := range fields {
-		if strings.EqualFold(field, "stream") && string(value) != "false" && string(value) != "null" {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", "the gateway does not support streaming yet")
-			return
-		}
-	}
+	// The upstream call gets a context of its own, which the gateway cancels.
+	// Until an answer starts, the caller hanging up cancels it at once, so no
+	// one waits or retries on behalf of a caller who has left.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	defer cancel()
+	stop := context.AfterFunc(r.Context(), cancel)
 
-	resp, err := g.send(r, body)
+	resp, err := g.send(ctx, r, body)
 	if err != nil {
-		if r.Context().Err() != nil {
+		if ctx.Err() != nil {
 			return // the caller hung up, so there is no one to answer
 		}
 		log.Printf("upstream call failed: %v", err)
@@ -145,9 +144,31 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Once an answer has started, the caller hanging up no longer cancels
+	// the call. The gateway reads the answer to the end, for up to
+	// drainLimit, because the token counts it charges for come at the end.
+	// A caller who leaves early pays for the whole answer.
+	if stop() {
+		stopDrain := context.AfterFunc(r.Context(), func() {
+			time.AfterFunc(g.drainLimit, cancel)
+			g.tell("caller gone")
+		})
+		defer stopDrain()
+	}
+	g.tell("answer started")
+
+	// The answer says whether it is a stream. Going by the answer, not by
+	// what the request asked for, means no wording of a request can get a
+	// stream handled as a plain answer or the other way round.
+	if resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		g.stream(w, resp, name, cancel)
+		return
+	}
+
 	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
 	if err != nil || len(answer) > maxAnswer {
-		if r.Context().Err() != nil {
+		if ctx.Err() != nil {
+			log.Printf("caller=%s left and the answer did not finish in time, so it was not counted", name)
 			return
 		}
 		log.Printf("reading the upstream answer failed: %v (%d bytes read)", err, len(answer))
@@ -161,6 +182,21 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A caller that is connected but not reading must not hold the answer,
+	// and this request, in memory for good.
+	http.NewResponseController(w).SetWriteDeadline(time.Now().Add(g.writeTimeout))
+	startAnswer(w, resp)
+	w.Write(answer)
+}
+
+func (g *gateway) tell(point string) {
+	if g.trace != nil {
+		g.trace(point)
+	}
+}
+
+// startAnswer sends the upstream's status and headers to the caller.
+func startAnswer(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
 	// These describe the account behind the upstream key. Callers are not
 	// shown them.
@@ -171,7 +207,6 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(answer)
 }
 
 // count reads the model and token counts out of a successful answer and adds
@@ -186,16 +221,21 @@ func (g *gateway) count(name string, answer []byte) bool {
 		log.Printf("caller=%s answer has no usage to count", name)
 		return false
 	}
-	if _, known := priceFor(message.Model); !known {
-		log.Printf("no price for model %q, charging the highest price in the table", message.Model)
+	g.record(name, message.Model, *message.Usage)
+	return true
+}
+
+// record adds one call's cost to the caller's total for the day.
+func (g *gateway) record(name, model string, u usage) {
+	if _, known := priceFor(model); !known {
+		log.Printf("no price for model %q, charging the highest price in the table", model)
 	}
-	micro := cost(message.Model, *message.Usage)
-	if err := g.spend.add(name, *message.Usage, micro); err != nil {
+	micro := cost(model, u)
+	if err := g.spend.add(name, u, micro); err != nil {
 		log.Printf("saving the spend file failed: %v", err)
 	}
 	log.Printf("caller=%s model=%q prompt_tokens=%d output_tokens=%d cost=$%.6f",
-		name, message.Model, message.Usage.promptTokens(), message.Usage.OutputTokens, float64(micro)/1e6)
-	return true
+		name, model, u.promptTokens(), u.OutputTokens, float64(micro)/1e6)
 }
 
 // parseCap turns DAILY_CAP_USD, a number of dollars, into millionths of a
@@ -211,14 +251,12 @@ func parseCap(dollars string) (int64, error) {
 }
 
 // attempt makes one upstream call with the caller's request.
-func (g *gateway) attempt(r *http.Request, body []byte) (*http.Response, error) {
+func (g *gateway) attempt(ctx context.Context, r *http.Request, body []byte) (*http.Response, error) {
 	target := g.upstream + "/v1/messages"
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	// r.Context() is cancelled when the caller hangs up, which cancels the
-	// upstream call too.
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -283,6 +321,9 @@ func main() {
 		upstream: strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/"),
 		apiKey:   os.Getenv("ANTHROPIC_API_KEY"),
 		sleep:    sleep,
+
+		writeTimeout: 30 * time.Second,
+		drainLimit:   5 * time.Minute,
 	}
 	if g.apiKey == "" {
 		log.Fatal("ANTHROPIC_API_KEY is not set")

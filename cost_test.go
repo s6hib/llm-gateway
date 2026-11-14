@@ -46,6 +46,10 @@ func TestCost(t *testing.T) {
 			`{"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000}}`, 8_000_000},
 		{"cache writes with no split are charged as 5-minute writes", "claude-opus-5-5",
 			`{"cache_creation_input_tokens":1000000}`, 5_000_000},
+		{"cache writes the split leaves out are charged as 5-minute writes: 0.9M at $5 + 0.1M at $8", "claude-opus-5-5",
+			`{"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":100000}}`, 4_500_000 + 800_000},
+		{"a split bigger than the total is charged in full", "claude-opus-5-5",
+			`{"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}`, 5_000_000 + 8_000_000},
 		{"haiku at exactly 100,000 prompt tokens pays the low price", "claude-haiku-5-5",
 			`{"input_tokens":50000,"cache_read_input_tokens":50000}`, 5_000 + 500},
 		{"haiku over 100,000 prompt tokens pays 5x on everything", "claude-haiku-5-5",
@@ -193,40 +197,6 @@ func TestFailedCallsCostNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(g.spend.path); err == nil {
 		t.Error("a spend file was written for a call that cost nothing")
-	}
-}
-
-func TestRejectsStreamingForNow(t *testing.T) {
-	var calls atomic.Int32
-	url := start(t, answering(&calls, `{"output_tokens":1}`))
-
-	for _, body := range []string{
-		`{"model":"claude-haiku-5-5","stream":true,"messages":[]}`,
-		`{"stream":1}`,                   // not a plain true, but an upstream might take it as one
-		`{"stream":"true"}`,              //
-		`{"STREAM":true}`,                // another spelling of the field
-		`{"stream":false,"Stream":true}`, //
-		`[{"stream":true}]`,              // not a JSON object
-		`stream=true`,                    // not JSON
-		``,
-	} {
-		resp, answer := post(t, url+"/v1/messages", body, nil)
-		if resp.StatusCode != http.StatusBadRequest || errorType(t, answer) != "invalid_request_error" {
-			t.Errorf("%s: status %d, body %s", body, resp.StatusCode, answer)
-		}
-	}
-	if calls.Load() != 0 {
-		t.Errorf("%d refused requests reached the upstream", calls.Load())
-	}
-
-	for _, body := range []string{
-		`{"model":"claude-haiku-5-5","messages":[]}`,
-		`{"model":"claude-haiku-5-5","stream":false,"messages":[]}`,
-		`{"model":"claude-haiku-5-5","stream":null,"messages":[]}`,
-	} {
-		if resp, _ := post(t, url+"/v1/messages", body, nil); resp.StatusCode != http.StatusOK {
-			t.Errorf("%s was refused with status %d", body, resp.StatusCode)
-		}
 	}
 }
 
