@@ -40,15 +40,19 @@ func parseKeys(spec string) (map[[32]byte]string, error) {
 // is read from the same two headers the Messages API takes a key in, so a
 // client only has to swap its API key for a gateway key.
 func (g *gateway) caller(r *http.Request) (string, bool) {
-	key := r.Header.Get("X-Api-Key")
-	if key == "" {
-		// The scheme word may be written in any case (RFC 9110, 11.1).
-		scheme, rest, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		if !strings.EqualFold(scheme, "Bearer") {
-			return "", false
-		}
-		key = strings.TrimSpace(rest)
-	}
-	name, ok := g.keys[sha256.Sum256([]byte(key))]
+	name, ok := g.keys[sha256.Sum256([]byte(presentedKey(r)))]
 	return name, ok
+}
+
+// presentedKey is the key a request carries, or "" when it carries none.
+func presentedKey(r *http.Request) string {
+	if key := r.Header.Get("X-Api-Key"); key != "" {
+		return key
+	}
+	// The scheme word may be written in any case (RFC 9110, 11.1).
+	scheme, rest, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(rest)
 }

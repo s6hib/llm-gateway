@@ -11,6 +11,7 @@ What works so far:
 - After each answer it reads the token counts, works out what the call cost, and adds that to the caller's total for the day. A caller that reaches its daily dollar cap gets a 429 until the next day starts.
 - A request with `"stream": true` is streamed: each piece of the answer goes to the caller as it arrives, and the token counts are read out of the stream as it passes.
 - A request can ask for its answer to be cached. An identical request from the same caller is then answered from memory, without a call to the API.
+- It writes one log line per request and keeps running counts per caller, which `GET /stats` returns.
 
 Still to come:
 
@@ -48,6 +49,7 @@ All settings are environment variables.
 | `MAX_RETRIES` | Extra tries after a failed call, from 0 to 10 | `2` |
 | `DAILY_CAP_USD` | Dollars each gateway key may spend per day. Days are UTC | `1` |
 | `SPEND_FILE` | The file the daily totals are kept in | `spend.json` |
+| `ADMIN_KEY` | The key that may read `GET /stats`. At least 16 characters, and not one of the gateway keys. Leave it unset and there is no stats page | none |
 | `UPSTREAM_URL` | Where requests are forwarded | `https://api.anthropic.com` |
 | `ADDR` | Where the gateway listens | `127.0.0.1:8080` |
 
@@ -114,6 +116,26 @@ curl -sN http://127.0.0.1:8080/v1/messages \
   -H 'content-type: application/json' \
   -d '{"model":"claude-haiku-5-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+## Logs and stats
+
+Every request to `/v1/messages` writes one line when it ends:
+
+```
+INFO request caller=demo status=200 ms=216 upstream_ms=214 tries=1 cache=miss model=claude-haiku-5-5 prompt_tokens=12 output_tokens=6 cost_usd=0.000004
+```
+
+`ms` is the whole request and `upstream_ms` is the part spent on the API, including retries and the waits between them. The difference is the gateway's own share: everything that was not waiting on the API, which also includes reading the request from the caller. Status 499 means the caller left before the gateway sent anything back.
+
+`GET /stats` returns counts for each caller since the gateway started: requests, a count per status code, cache hits, retries, and p50, p95 and p99 over the last 1,000 requests for both the total time and the gateway's own share of it. It also has each caller's tokens and cost for the day so far. It needs the admin key:
+
+```sh
+curl -s http://127.0.0.1:8080/stats -H 'x-api-key: YOUR_ADMIN_KEY'
+```
+
+The counts are kept in memory and start again from zero when the gateway restarts. The day's spend comes from the spend file, so it does not.
+
+`GET /healthz` answers 200 with no key, for whatever checks that the gateway is up.
 
 ## Retries
 

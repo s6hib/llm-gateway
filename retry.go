@@ -27,8 +27,9 @@ const (
 // send makes the upstream call and tries again, up to maxRetries more times,
 // when the call fails in a way that may pass. A retry sends the same request
 // again, so a call that died after the upstream began work can be paid for twice.
-func (g *gateway) send(ctx context.Context, r *http.Request, body []byte) (*http.Response, error) {
+func (g *gateway) send(ctx context.Context, r *http.Request, body []byte, c *call) (*http.Response, error) {
 	for try := 0; ; try++ {
+		c.tries = try + 1
 		resp, err := g.attempt(ctx, r, body)
 		if err != nil && ctx.Err() != nil {
 			return nil, err // the caller hung up

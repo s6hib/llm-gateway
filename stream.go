@@ -19,7 +19,7 @@ const maxEventLine = 1 << 20 // 1 MB
 // If the caller goes away, or stops taking pieces, the gateway stops sending
 // but keeps reading, because the final token counts come at the end of the
 // stream. giveUp cancels the upstream call if that takes longer than drainLimit.
-func (g *gateway) stream(w http.ResponseWriter, resp *http.Response, name string, giveUp func()) {
+func (g *gateway) stream(w http.ResponseWriter, resp *http.Response, c *call, giveUp func()) {
 	startAnswer(w, resp)
 	// Go holds written bytes back until it has a few thousand of them. Flush
 	// sends what there is, so the caller sees each piece right away.
@@ -51,10 +51,10 @@ func (g *gateway) stream(w http.ResponseWriter, resp *http.Response, name string
 
 	model, u, ok := counter.result()
 	if !ok {
-		log.Printf("caller=%s stream had nothing to count", name)
+		log.Printf("caller=%s stream had nothing to count", c.name)
 		return
 	}
-	g.record(name, model, u)
+	g.record(c, model, u)
 }
 
 // streamCounter follows a Messages API event stream. The stream is lines of

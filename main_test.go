@@ -34,7 +34,7 @@ func testGateway(t *testing.T, upstreamURL string, perMinute int) *gateway {
 		spend: spend, dailyCap: 1000_000_000, // $1,000, out of the way unless a test lowers it
 		upstream: upstreamURL, apiKey: "upstream-key", client: newClient(time.Minute),
 		keys: keys, limiter: newLimiter(perMinute), maxRetries: 2,
-		writeTimeout: 30 * time.Second, drainLimit: time.Minute, cache: newCache(),
+		writeTimeout: 30 * time.Second, drainLimit: time.Minute, cache: newCache(), stats: newStats(),
 		// Tests do not wait between tries.
 		sleep: func(context.Context, time.Duration) error { return nil },
 	}
@@ -211,6 +211,9 @@ func TestRejectsOversizedBody(t *testing.T) {
 
 	if resp.StatusCode != http.StatusRequestEntityTooLarge || errorType(t, body) != "request_too_large" {
 		t.Errorf("status %d, body %s", resp.StatusCode, body)
+	}
+	if !resp.Close {
+		t.Error("the connection was left open, so the gateway would go on reading the oversized body")
 	}
 	if called {
 		t.Error("the oversized request was sent upstream")

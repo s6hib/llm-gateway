@@ -69,6 +69,19 @@ func (s *spendStore) spentToday(name string) (spent int64, resets time.Duration)
 	return spent, midnight.Sub(now)
 }
 
+// today is a copy of every caller's totals for the current day.
+func (s *spendStore) today() map[string]tally {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	totals := map[string]tally{}
+	for name, t := range s.days[s.now().UTC().Format(dayFormat)] {
+		if t != nil {
+			totals[name] = *t
+		}
+	}
+	return totals
+}
+
 // add counts one answered call against the caller and saves the file.
 func (s *spendStore) add(name string, u usage, costMicro int64) error {
 	s.mu.Lock()

@@ -9,6 +9,7 @@
 //	MAX_RETRIES            extra tries after a failed upstream call (default 2)
 //	DAILY_CAP_USD          dollars each caller may spend per UTC day (default 1)
 //	SPEND_FILE             where the per-caller totals are kept (default spend.json)
+//	ADMIN_KEY              the key that may read GET /stats (optional; no key, no stats page)
 //	UPSTREAM_URL           where requests are forwarded (default https://api.anthropic.com)
 //	ADDR                   where the gateway listens (default 127.0.0.1:8080)
 package main
@@ -16,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -69,6 +71,10 @@ type gateway struct {
 	dailyCap int64 // millionths of a dollar, per caller per UTC day
 
 	cache *cache
+
+	stats    *stats
+	adminKey [32]byte // hash of ADMIN_KEY
+	hasAdmin bool
 }
 
 // newClient returns an HTTP client that gives up on a call when the upstream
@@ -83,6 +89,8 @@ func newClient(timeout time.Duration) *http.Client {
 func (g *gateway) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", g.messages)
+	mux.HandleFunc("GET /stats", g.statsPage)
+	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found_error", "the gateway only serves POST /v1/messages")
 	})
@@ -91,7 +99,13 @@ func (g *gateway) handler() http.Handler {
 
 // messages sends the caller's request upstream and copies the answer back.
 func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
+	c := &call{start: time.Now()}
+	noted := &statusWriter{ResponseWriter: w}
+	w = noted
+	defer func() { g.finish(c, noted.status) }()
+
 	name, ok := g.caller(r)
+	c.name = name
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication_error", "missing or unknown gateway key")
 		return
@@ -112,7 +126,10 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	// MaxBytesReader is given the real writer, not the wrapper: on a body
+	// that is too big it tells that writer to close the connection, so the
+	// gateway does not go on reading the rest of the oversized body.
+	body, err := io.ReadAll(http.MaxBytesReader(noted.ResponseWriter, r.Body, maxBody))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -132,13 +149,14 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	if wantsCache {
 		key = cacheKey(name, r, body)
 		if kept, ok := g.cache.get(key); ok {
-			log.Printf("caller=%s answered from the cache", name)
+			c.cache = "hit"
 			copyHeaders(w.Header(), kept.header)
 			w.Header().Set(cacheResult, "hit")
 			http.NewResponseController(w).SetWriteDeadline(time.Now().Add(g.writeTimeout))
 			w.Write(kept.body)
 			return
 		}
+		c.cache = "miss"
 		w.Header().Set(cacheResult, "miss")
 	}
 
@@ -149,7 +167,9 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stop := context.AfterFunc(r.Context(), cancel)
 
-	resp, err := g.send(ctx, r, body)
+	sent := time.Now()
+	resp, err := g.send(ctx, r, body, c)
+	c.upstream = time.Since(sent)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // the caller hung up, so there is no one to answer
@@ -182,11 +202,13 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	// what the request asked for, means no wording of a request can get a
 	// stream handled as a plain answer or the other way round.
 	if resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		g.stream(w, resp, name, cancel)
+		g.stream(w, resp, c, cancel)
+		c.upstream = time.Since(sent)
 		return
 	}
 
 	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
+	c.upstream = time.Since(sent)
 	if err != nil || len(answer) > maxAnswer {
 		if ctx.Err() != nil {
 			log.Printf("caller=%s left and the answer did not finish in time, so it was not counted", name)
@@ -198,7 +220,7 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	}
 	// A successful answer that cannot be counted is not passed on. Otherwise
 	// any answer the gateway fails to understand would be free to the caller.
-	if resp.StatusCode == http.StatusOK && !g.count(name, answer) {
+	if resp.StatusCode == http.StatusOK && !g.count(c, answer) {
 		writeError(w, http.StatusBadGateway, "api_error", "the gateway could not read the token counts in the upstream's answer")
 		return
 	}
@@ -241,30 +263,28 @@ func startAnswer(w http.ResponseWriter, resp *http.Response) {
 // count reads the model and token counts out of a successful answer and adds
 // their cost to the caller's total for the day. It returns false when the
 // answer has no token counts to read.
-func (g *gateway) count(name string, answer []byte) bool {
+func (g *gateway) count(c *call, answer []byte) bool {
 	var message struct {
 		Model string `json:"model"`
 		Usage *usage `json:"usage"`
 	}
 	if err := json.Unmarshal(answer, &message); err != nil || message.Usage == nil {
-		log.Printf("caller=%s answer has no usage to count", name)
+		log.Printf("caller=%s answer has no usage to count", c.name)
 		return false
 	}
-	g.record(name, message.Model, *message.Usage)
+	g.record(c, message.Model, *message.Usage)
 	return true
 }
 
 // record adds one call's cost to the caller's total for the day.
-func (g *gateway) record(name, model string, u usage) {
+func (g *gateway) record(c *call, model string, u usage) {
 	if _, known := priceFor(model); !known {
 		log.Printf("no price for model %q, charging the highest price in the table", model)
 	}
-	micro := cost(model, u)
-	if err := g.spend.add(name, u, micro); err != nil {
+	c.model, c.prompt, c.output, c.micro = model, u.promptTokens(), u.OutputTokens, cost(model, u)
+	if err := g.spend.add(c.name, u, c.micro); err != nil {
 		log.Printf("saving the spend file failed: %v", err)
 	}
-	log.Printf("caller=%s model=%q prompt_tokens=%d output_tokens=%d cost=$%.6f",
-		name, model, u.promptTokens(), u.OutputTokens, float64(micro)/1e6)
 }
 
 // parseCap turns DAILY_CAP_USD, a number of dollars, into millionths of a
@@ -354,6 +374,7 @@ func main() {
 		writeTimeout: 30 * time.Second,
 		drainLimit:   5 * time.Minute,
 		cache:        newCache(),
+		stats:        newStats(),
 	}
 	if g.apiKey == "" {
 		log.Fatal("ANTHROPIC_API_KEY is not set")
@@ -379,6 +400,12 @@ func main() {
 		log.Fatal("RATE_LIMIT_PER_MINUTE must be a whole number above 0")
 	}
 	g.keys, g.limiter = keys, newLimiter(perMinute)
+	if admin := os.Getenv("ADMIN_KEY"); admin != "" {
+		g.adminKey, g.hasAdmin = sha256.Sum256([]byte(admin)), true
+		if len(admin) < minKeyLength || keys[g.adminKey] != "" {
+			log.Fatalf("ADMIN_KEY must be at least %d characters and must not be one of the gateway keys", minKeyLength)
+		}
+	}
 	server := &http.Server{
 		Addr:              env("ADDR", "127.0.0.1:8080"),
 		Handler:           g.handler(),
