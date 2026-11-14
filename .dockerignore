@@ -1,0 +1,5 @@
+# Send the build only what the Dockerfile copies. Everything else stays on this
+# machine, the keys in .env above all.
+*
+!go.mod
+!*.go
