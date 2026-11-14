@@ -2,9 +2,11 @@
 //
 // Settings come from the environment:
 //
-//	ANTHROPIC_API_KEY  the upstream key (required)
-//	UPSTREAM_URL       where requests are forwarded (default https://api.anthropic.com)
-//	ADDR               where the gateway listens (default 127.0.0.1:8080)
+//	ANTHROPIC_API_KEY      the upstream key (required)
+//	GATEWAY_KEYS           who may call, as name:key,name:key (required)
+//	RATE_LIMIT_PER_MINUTE  requests a minute allowed per caller (default 60)
+//	UPSTREAM_URL           where requests are forwarded (default https://api.anthropic.com)
+//	ADDR                   where the gateway listens (default 127.0.0.1:8080)
 package main
 
 import (
@@ -13,8 +15,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,6 +38,8 @@ type gateway struct {
 	upstream string // base address with no trailing slash
 	apiKey   string // sent upstream in place of whatever the caller sent
 	client   *http.Client
+	keys     map[[32]byte]string // hash of a gateway key -> the caller's name
+	limiter  *limiter
 }
 
 func (g *gateway) handler() http.Handler {
@@ -47,6 +53,19 @@ func (g *gateway) handler() http.Handler {
 
 // messages sends the caller's request upstream and copies the answer back.
 func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
+	name, ok := g.caller(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "missing or unknown gateway key")
+		return
+	}
+	if ok, wait := g.limiter.allow(name); !ok {
+		// Whole seconds, rounded up, and never 0: that would tell the caller
+		// to retry at once.
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(wait.Seconds())))))
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "this gateway key has used up its requests for now")
+		return
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		var tooBig *http.MaxBytesError
@@ -70,7 +89,7 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(req.Header, r.Header)
-	// The caller's credentials stop here. Only the gateway holds the upstream
+	// The caller's gateway key stops here. Only the gateway holds the upstream
 	// key, and the caller does not get to pick the workspace it is used in.
 	for _, name := range []string{"X-Api-Key", "Cookie", "Anthropic-Workspace-Id"} {
 		req.Header.Del(name)
@@ -152,6 +171,15 @@ func main() {
 	if g.apiKey == "" {
 		log.Fatal("ANTHROPIC_API_KEY is not set")
 	}
+	keys, err := parseKeys(os.Getenv("GATEWAY_KEYS"))
+	if err != nil {
+		log.Fatalf("GATEWAY_KEYS: %v", err)
+	}
+	perMinute, err := strconv.Atoi(env("RATE_LIMIT_PER_MINUTE", "60"))
+	if err != nil || perMinute < 1 {
+		log.Fatal("RATE_LIMIT_PER_MINUTE must be a whole number above 0")
+	}
+	g.keys, g.limiter = keys, newLimiter(perMinute)
 	server := &http.Server{
 		Addr:              env("ADDR", "127.0.0.1:8080"),
 		Handler:           g.handler(),

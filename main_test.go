@@ -13,14 +13,26 @@ import (
 
 const requestBody = `{"model":"claude-haiku-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
 
+// testKey is the gateway key the tests call with. post sends it unless the
+// test sets its own X-Api-Key header.
+const testKey = "test-gateway-key-0001"
+
+func testGateway(t *testing.T, upstreamURL string, perMinute int) *gateway {
+	t.Helper()
+	keys, err := parseKeys("tester:" + testKey + ",other:test-gateway-key-0002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &gateway{upstream: upstreamURL, apiKey: "upstream-key", client: &http.Client{}, keys: keys, limiter: newLimiter(perMinute)}
+}
+
 // start runs a gateway in front of the given upstream and returns the
 // gateway's address.
 func start(t *testing.T, upstream http.Handler) string {
 	t.Helper()
 	up := httptest.NewServer(upstream)
 	t.Cleanup(up.Close)
-	g := &gateway{upstream: up.URL, apiKey: "upstream-key", client: up.Client()}
-	gw := httptest.NewServer(g.handler())
+	gw := httptest.NewServer(testGateway(t, up.URL, 1000).handler())
 	t.Cleanup(gw.Close)
 	return gw.URL
 }
@@ -31,6 +43,7 @@ func post(t *testing.T, url, body string, headers map[string]string) (*http.Resp
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("X-Api-Key", testKey)
 	for name, value := range headers {
 		req.Header.Set(name, value)
 	}
@@ -72,8 +85,8 @@ func TestForwardsRequestAndAnswer(t *testing.T) {
 	url := start(t, upstream)
 
 	resp, body := post(t, url+"/v1/messages?beta=true", requestBody, map[string]string{
-		"X-Api-Key":              "caller-key",
-		"Authorization":          "Bearer caller-key",
+		"X-Api-Key":              testKey,
+		"Authorization":          "Bearer " + testKey,
 		"Anthropic-Version":      "2026-10-21",
 		"Content-Type":           "application/json",
 		"Connection":             "X-Hop",
@@ -166,8 +179,7 @@ func TestHidesAccountHeadersFromCaller(t *testing.T) {
 func TestUpstreamDown(t *testing.T) {
 	up := httptest.NewServer(http.NotFoundHandler())
 	up.Close() // nothing is listening at up.URL any more
-	g := &gateway{upstream: up.URL, apiKey: "upstream-key", client: &http.Client{}}
-	gw := httptest.NewServer(g.handler())
+	gw := httptest.NewServer(testGateway(t, up.URL, 1000).handler())
 	defer gw.Close()
 
 	resp, body := post(t, gw.URL+"/v1/messages", requestBody, nil)
