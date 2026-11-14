@@ -14,6 +14,17 @@ import (
 	"time"
 )
 
+// A model the table leaves out must never be charged less than a model the
+// table has.
+func TestUnlistedPriceIsAtLeastEveryListedPrice(t *testing.T) {
+	for id, p := range prices {
+		if unlistedPrice.input < p.input || unlistedPrice.output < p.output ||
+			unlistedPrice.input*unlistedPrice.cacheRead < p.input*p.cacheRead {
+			t.Errorf("%s costs more than the price for unlisted models: %+v", id, p)
+		}
+	}
+}
+
 func parseUsage(t *testing.T, raw string) usage {
 	t.Helper()
 	var u usage
@@ -62,8 +73,12 @@ func TestCost(t *testing.T) {
 			`{"server_tool_use":{"web_search_requests":3}}`, 30_000},
 		{"a dated id uses its model's price", "claude-haiku-5-5-20261001",
 			`{"input_tokens":100000}`, 10_000},
-		{"an unknown model is charged as the most expensive", "claude-something-new",
-			`{"input_tokens":1000000}`, 8_000_000},
+		{"a model not in the table is charged the highest list price: $15 in", "claude-something-new",
+			`{"input_tokens":1000000}`, 15_000_000},
+		{"and $75 out, which is what the older Opus 4.1 really costs", "claude-opus-4-1",
+			`{"output_tokens":1000000}`, 75_000_000},
+		{"an older model whose name starts like a current one is not mistaken for it", "claude-fable-5-1",
+			`{"output_tokens":1000000}`, 75_000_000},
 		{"the fake upstream's reply: 12 in, 6 out on haiku", "claude-haiku-5-5",
 			`{"input_tokens":12,"output_tokens":6}`, 4}, // 1.2 + 3 = 4.2, rounded
 		{"negative counts are counted as 0", "claude-opus-5-5",

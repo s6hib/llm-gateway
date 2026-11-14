@@ -71,7 +71,7 @@ A caller sends its gateway key the way it would send an API key, in `x-api-key` 
 
 ## Cost and the daily cap
 
-The gateway takes `model` and `usage` from each successful answer and multiplies the token counts by Anthropic's list prices. The price table is in `cost.go` and was read from the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-13. It covers Claude Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5. A model that is not in the table is charged at the highest price in it, so a total can come out too high but not too low.
+The gateway takes `model` and `usage` from each successful answer and multiplies the token counts by Anthropic's list prices. The price table is in `cost.go` and was read from the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-13. It covers Claude Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5. A model that is not in the table, such as an older one, is charged at the highest price on the pricing page that day, $15 per million input tokens and $75 per million output tokens. That is at least what any model listed then costs. A later model that costs more would be counted low until the table is updated.
 
 The cost counts input and output tokens, prompt-cache reads and writes, the higher price for Haiku 5.5 prompts over 100,000 tokens, fast mode, US-only inference and web searches. It does not count batch discounts or other tool charges. It is an estimate; the invoice from Anthropic is the real number.
 

@@ -280,7 +280,7 @@ func (g *gateway) count(c *call, answer []byte) bool {
 // record adds one call's cost to the caller's total for the day.
 func (g *gateway) record(c *call, model string, u usage) {
 	if _, known := priceFor(model); !known {
-		log.Printf("no price for model %q, charging the highest price in the table", model)
+		log.Printf("no price for model %q, charging the highest list price", model)
 	}
 	c.model, c.prompt, c.output, c.micro = model, u.promptTokens(), u.OutputTokens, cost(model, u)
 	if err := g.spend.add(c.name, u, c.micro); err != nil {

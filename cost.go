@@ -11,10 +11,8 @@ type price struct {
 	cacheRead     float64 // tokens read from the prompt cache cost this share of the input price
 }
 
-// prices are Anthropic's list prices, read from
+// prices are Anthropic's list prices for the current models, read from
 // https://platform.claude.com/docs/en/about-claude/pricing on 2026-11-13.
-// A model missing from this table is charged as the most expensive one, so
-// the gateway's totals can run high for it but never low.
 var prices = map[string]price{
 	"claude-fable-5-2":  {input: 8, output: 40, cacheRead: 0.025},
 	"claude-opus-5-5":   {input: 4, output: 20, cacheRead: 0.05},
@@ -78,8 +76,15 @@ func (u usage) promptTokens() int64 {
 	return max(0, u.InputTokens) + max(0, u.CacheReadInputTokens) + fiveMinute + oneHour
 }
 
+// unlistedPrice is what a model missing from the table is charged. It is the
+// highest price of any model on the pricing page that day (Claude Opus 4.1),
+// which is more than anything in the table. So an older model the table
+// leaves out is counted at its own price or above, not below. A future model
+// that costs more than this would be counted low until the table is updated.
+var unlistedPrice = price{input: 15, output: 75, cacheRead: 0.1}
+
 // priceFor finds a model's price. known is false when the model is not in the
-// table and the most expensive price was used.
+// table and unlistedPrice was used.
 func priceFor(model string) (p price, known bool) {
 	for id, p := range prices {
 		// An id may carry a date after the name, like claude-haiku-5-5-20261001.
@@ -87,12 +92,7 @@ func priceFor(model string) (p price, known bool) {
 			return p, true
 		}
 	}
-	for _, candidate := range prices {
-		if candidate.output > p.output {
-			p = candidate
-		}
-	}
-	return p, false
+	return unlistedPrice, false
 }
 
 // cost estimates what a call cost, in millionths of a dollar. Money is kept
