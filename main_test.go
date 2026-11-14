@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/s6hib/llm-gateway/fake"
 )
@@ -23,7 +25,12 @@ func testGateway(t *testing.T, upstreamURL string, perMinute int) *gateway {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &gateway{upstream: upstreamURL, apiKey: "upstream-key", client: &http.Client{}, keys: keys, limiter: newLimiter(perMinute)}
+	return &gateway{
+		upstream: upstreamURL, apiKey: "upstream-key", client: newClient(time.Minute),
+		keys: keys, limiter: newLimiter(perMinute), maxRetries: 2,
+		// Tests do not wait between tries.
+		sleep: func(context.Context, time.Duration) error { return nil },
+	}
 }
 
 // start runs a gateway in front of the given upstream and returns the
@@ -80,7 +87,7 @@ func TestForwardsRequestAndAnswer(t *testing.T) {
 		raw, _ := io.ReadAll(r.Body)
 		seen, seenBody = r, string(raw)
 		r.Body = io.NopCloser(strings.NewReader(seenBody))
-		fake.Handler(0).ServeHTTP(w, r)
+		fake.Handler(0, 0).ServeHTTP(w, r)
 	})
 	url := start(t, upstream)
 
@@ -204,7 +211,7 @@ func TestRejectsOversizedBody(t *testing.T) {
 }
 
 func TestOtherPathsAreNotFound(t *testing.T) {
-	url := start(t, fake.Handler(0))
+	url := start(t, fake.Handler(0, 0))
 
 	for _, try := range []struct{ method, path string }{
 		{http.MethodPost, "/v1/models"},

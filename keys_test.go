@@ -58,7 +58,7 @@ func TestRejectsMissingOrUnknownKey(t *testing.T) {
 }
 
 func TestAcceptsKeyInEitherHeader(t *testing.T) {
-	url := start(t, fake.Handler(0))
+	url := start(t, fake.Handler(0, 0))
 
 	for _, headers := range []map[string]string{
 		{"X-Api-Key": testKey},
@@ -73,7 +73,7 @@ func TestAcceptsKeyInEitherHeader(t *testing.T) {
 }
 
 func TestRateLimitIsPerKey(t *testing.T) {
-	up := httptest.NewServer(fake.Handler(0))
+	up := httptest.NewServer(fake.Handler(0, 0))
 	defer up.Close()
 	g := testGateway(t, up.URL, 2) // 2 requests a minute
 	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -113,7 +113,7 @@ func TestRateLimitIsPerKey(t *testing.T) {
 }
 
 func TestRetryAfterIsNeverZero(t *testing.T) {
-	up := httptest.NewServer(fake.Handler(0))
+	up := httptest.NewServer(fake.Handler(0, 0))
 	defer up.Close()
 	g := testGateway(t, up.URL, 1)
 	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

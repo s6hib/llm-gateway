@@ -5,12 +5,15 @@ package fake
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"net/http"
 	"time"
 )
 
 // Handler returns a server that waits for delay and then sends a canned reply.
-func Handler(delay time.Duration) http.Handler {
+// errorRate is the share of requests, from 0 to 1, that get a 529
+// overloaded_error in place of the reply, for testing how a caller copes.
+func Handler(delay time.Duration, errorRate float64) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -31,6 +34,11 @@ func Handler(delay time.Duration) http.Handler {
 		select {
 		case <-time.After(delay):
 		case <-r.Context().Done(): // the caller hung up
+			return
+		}
+
+		if rand.Float64() < errorRate {
+			writeError(w, 529, "overloaded_error", "the fake upstream is pretending to be overloaded")
 			return
 		}
 

@@ -5,18 +5,23 @@
 //	ANTHROPIC_API_KEY      the upstream key (required)
 //	GATEWAY_KEYS           who may call, as name:key,name:key (required)
 //	RATE_LIMIT_PER_MINUTE  requests a minute allowed per caller (default 60)
+//	UPSTREAM_TIMEOUT       how long to wait for the upstream to start answering (default 60s)
+//	MAX_RETRIES            extra tries after a failed upstream call (default 2)
 //	UPSTREAM_URL           where requests are forwarded (default https://api.anthropic.com)
 //	ADDR                   where the gateway listens (default 127.0.0.1:8080)
 package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +45,18 @@ type gateway struct {
 	client   *http.Client
 	keys     map[[32]byte]string // hash of a gateway key -> the caller's name
 	limiter  *limiter
+
+	maxRetries int
+	sleep      func(context.Context, time.Duration) error // swapped out in tests
+}
+
+// newClient returns an HTTP client that gives up on a call when the upstream
+// has not started its answer within timeout. The limit is on the wait for the
+// first byte of the answer, so an answer that has started is never cut off.
+func newClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	return &http.Client{Transport: transport}
 }
 
 func (g *gateway) handler() http.Handler {
@@ -77,33 +94,17 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	url := g.upstream + "/v1/messages"
-	if r.URL.RawQuery != "" {
-		url += "?" + r.URL.RawQuery
-	}
-	// r.Context() is cancelled when the caller hangs up, which cancels the
-	// upstream call too.
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
+	resp, err := g.send(r, body)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "api_error", "the gateway could not build the upstream request")
-		return
-	}
-	copyHeaders(req.Header, r.Header)
-	// The caller's gateway key stops here. Only the gateway holds the upstream
-	// key, and the caller does not get to pick the workspace it is used in.
-	for _, name := range []string{"X-Api-Key", "Cookie", "Anthropic-Workspace-Id"} {
-		req.Header.Del(name)
-	}
-	req.Header.Set("Authorization", "Bearer "+g.apiKey)
-	// With no Accept-Encoding of its own, Go's client asks for gzip and
-	// unpacks the answer, so the body copied back is always plain.
-	req.Header.Del("Accept-Encoding")
-	// The body is already in memory, so there is nothing to wait for.
-	req.Header.Del("Expect")
-
-	resp, err := g.client.Do(req)
-	if err != nil {
+		if r.Context().Err() != nil {
+			return // the caller hung up, so there is no one to answer
+		}
 		log.Printf("upstream call failed: %v", err)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			writeError(w, http.StatusGatewayTimeout, "timeout_error", "the upstream took too long to answer")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "api_error", "the gateway could not reach the upstream")
 		return
 	}
@@ -120,6 +121,34 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// attempt makes one upstream call with the caller's request.
+func (g *gateway) attempt(r *http.Request, body []byte) (*http.Response, error) {
+	target := g.upstream + "/v1/messages"
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	// r.Context() is cancelled when the caller hangs up, which cancels the
+	// upstream call too.
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	copyHeaders(req.Header, r.Header)
+	// The caller's gateway key stops here. Only the gateway holds the upstream
+	// key, and the caller does not get to pick the workspace it is used in.
+	for _, name := range []string{"X-Api-Key", "Cookie", "Anthropic-Workspace-Id"} {
+		req.Header.Del(name)
+	}
+	req.Header.Set("Authorization", "Bearer "+g.apiKey)
+	// With no Accept-Encoding of its own, Go's client asks for gzip and
+	// unpacks the answer, so the body copied back is always plain.
+	req.Header.Del("Accept-Encoding")
+	// The body is already in memory, so there is nothing to wait for.
+	req.Header.Del("Expect")
+
+	return g.client.Do(req)
 }
 
 // copyHeaders copies every header from src to dst except the hop-by-hop ones.
@@ -166,10 +195,22 @@ func main() {
 	g := &gateway{
 		upstream: strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/"),
 		apiKey:   os.Getenv("ANTHROPIC_API_KEY"),
-		client:   &http.Client{},
+		sleep:    sleep,
 	}
 	if g.apiKey == "" {
 		log.Fatal("ANTHROPIC_API_KEY is not set")
+	}
+	if u, err := url.Parse(g.upstream); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		log.Fatal("UPSTREAM_URL must be an http or https address")
+	}
+	timeout, err := time.ParseDuration(env("UPSTREAM_TIMEOUT", "60s"))
+	if err != nil || timeout <= 0 {
+		log.Fatal("UPSTREAM_TIMEOUT must be a length of time above 0, like 60s or 2m")
+	}
+	g.client = newClient(timeout)
+	g.maxRetries, err = strconv.Atoi(env("MAX_RETRIES", "2"))
+	if err != nil || g.maxRetries < 0 || g.maxRetries > 10 {
+		log.Fatal("MAX_RETRIES must be a whole number from 0 to 10")
 	}
 	keys, err := parseKeys(os.Getenv("GATEWAY_KEYS"))
 	if err != nil {
