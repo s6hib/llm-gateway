@@ -10,10 +10,10 @@ What works so far:
 - When the API is overloaded, rate limited, erroring or unreachable, the gateway tries again, twice by default, waiting longer each time. If the API has not started answering after 60 seconds, that try counts as failed.
 - After each answer it reads the token counts, works out what the call cost, and adds that to the caller's total for the day. A caller that reaches its daily dollar cap gets a 429 until the next day starts.
 - A request with `"stream": true` is streamed: each piece of the answer goes to the caller as it arrives, and the token counts are read out of the stream as it passes.
+- A request can ask for its answer to be cached. An identical request from the same caller is then answered from memory, without a call to the API.
 
 Still to come:
 
-- a cache for identical repeated requests
 - a load test against a fake upstream, with the numbers published here
 
 It is written in Go with the standard library. The first caller will be [fineprint](https://github.com/s6hib/fineprint).
@@ -75,6 +75,26 @@ Totals are kept per key and per day in `SPEND_FILE`, in millionths of a dollar:
 ```
 
 The file is read at startup, so a restart does not reset the totals. The cap is checked before a call is sent and the cost is known only after it, so a key can finish the day over its cap by the calls that were already running when it got there. Failed calls are not counted. If a successful plain answer has no token counts the gateway can read, the caller gets a 502 in its place, so an answer is never handed over uncounted.
+
+## Cache
+
+The cache is off unless a request asks for it, because a model can give a different answer to the same prompt each time, and a caller that sends one prompt several times to compare the answers needs fresh ones. To ask, send the header `X-Cache-Ttl` with the number of seconds to keep the answer, from 1 to 3600:
+
+```sh
+curl -si http://127.0.0.1:8080/v1/messages \
+  -H 'x-api-key: demo-key-0123456789' \
+  -H 'x-cache-ttl: 60' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-haiku-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The answer comes back with `X-Cache: miss` the first time and `X-Cache: hit` after that, until the time runs out. A hit costs nothing and is not added to the caller's spend. It still uses one request of the rate limit.
+
+Two requests share an answer only when the caller, the body, the query string and the `anthropic-version`, `anthropic-beta` and `content-type` headers are all the same, byte for byte. Each caller has its own entries, so one caller never gets an answer made for another. Only successful plain answers are kept. Errors and streamed answers are not.
+
+The cache holds up to 1,000 answers of up to 1 MB each, in memory. A restart empties it.
+
+This is separate from Anthropic's prompt caching. Prompt caching is done by the API and makes the repeated part of a prompt cheaper. The `cache_control` fields that turn it on are part of the request body, which the gateway passes through unchanged.
 
 ## Streaming
 

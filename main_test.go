@@ -34,7 +34,7 @@ func testGateway(t *testing.T, upstreamURL string, perMinute int) *gateway {
 		spend: spend, dailyCap: 1000_000_000, // $1,000, out of the way unless a test lowers it
 		upstream: upstreamURL, apiKey: "upstream-key", client: newClient(time.Minute),
 		keys: keys, limiter: newLimiter(perMinute), maxRetries: 2,
-		writeTimeout: 30 * time.Second, drainLimit: time.Minute,
+		writeTimeout: 30 * time.Second, drainLimit: time.Minute, cache: newCache(),
 		// Tests do not wait between tries.
 		sleep: func(context.Context, time.Duration) error { return nil },
 	}

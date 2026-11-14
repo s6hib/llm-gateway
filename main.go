@@ -67,6 +67,8 @@ type gateway struct {
 
 	spend    *spendStore
 	dailyCap int64 // millionths of a dollar, per caller per UTC day
+
+	cache *cache
 }
 
 // newClient returns an HTTP client that gives up on a call when the upstream
@@ -119,6 +121,25 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "the gateway could not read the request body")
 		return
+	}
+
+	ttl, wantsCache, err := cacheTTL(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	var key [32]byte
+	if wantsCache {
+		key = cacheKey(name, r, body)
+		if kept, ok := g.cache.get(key); ok {
+			log.Printf("caller=%s answered from the cache", name)
+			copyHeaders(w.Header(), kept.header)
+			w.Header().Set(cacheResult, "hit")
+			http.NewResponseController(w).SetWriteDeadline(time.Now().Add(g.writeTimeout))
+			w.Write(kept.body)
+			return
+		}
+		w.Header().Set(cacheResult, "miss")
 	}
 
 	// The upstream call gets a context of its own, which the gateway cancels.
@@ -186,6 +207,14 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	// and this request, in memory for good.
 	http.NewResponseController(w).SetWriteDeadline(time.Now().Add(g.writeTimeout))
 	startAnswer(w, resp)
+	// Only a successful, counted answer is kept. An error is never kept, so
+	// a failure is not repeated to the next identical request.
+	if wantsCache && resp.StatusCode == http.StatusOK {
+		header := w.Header().Clone()
+		header.Del(cacheResult)
+		header.Del("Date") // a hit gets the time it is sent, not the time it was made
+		g.cache.put(key, header, answer, ttl)
+	}
 	w.Write(answer)
 }
 
@@ -263,7 +292,7 @@ func (g *gateway) attempt(ctx context.Context, r *http.Request, body []byte) (*h
 	copyHeaders(req.Header, r.Header)
 	// The caller's gateway key stops here. Only the gateway holds the upstream
 	// key, and the caller does not get to pick the workspace it is used in.
-	for _, name := range []string{"X-Api-Key", "Cookie", "Anthropic-Workspace-Id"} {
+	for _, name := range []string{"X-Api-Key", "Cookie", "Anthropic-Workspace-Id", cacheHeader} {
 		req.Header.Del(name)
 	}
 	req.Header.Set("Authorization", "Bearer "+g.apiKey)
@@ -324,6 +353,7 @@ func main() {
 
 		writeTimeout: 30 * time.Second,
 		drainLimit:   5 * time.Minute,
+		cache:        newCache(),
 	}
 	if g.apiKey == "" {
 		log.Fatal("ANTHROPIC_API_KEY is not set")
