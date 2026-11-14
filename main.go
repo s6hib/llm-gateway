@@ -91,6 +91,7 @@ func (g *gateway) handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", g.messages)
 	mux.HandleFunc("GET /stats", g.statsPage)
 	mux.HandleFunc("GET /healthz", health)
+	mux.HandleFunc("GET /{$}", landing) // {$} matches the bare address only, not every path under it
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found_error", "the gateway only serves POST /v1/messages")
 	})

@@ -151,6 +151,24 @@ func TestHealthNeedsNoKey(t *testing.T) {
 	}
 }
 
+func TestLandingPageIsOnlyAtTheBareAddress(t *testing.T) {
+	_, url := streamGateway(t, fake.Handler(0, 0))
+
+	resp, body := get(t, url+"/", nil)
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||
+		!strings.Contains(body, "https://github.com/s6hib/llm-gateway") {
+		t.Errorf("GET /: status %d, type %q, body %s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	}
+	// Every other path still gets the API's not-found error, and the page
+	// does not answer a POST.
+	if resp, body := get(t, url+"/anything", nil); resp.StatusCode != http.StatusNotFound || errorType(t, body) != "not_found_error" {
+		t.Errorf("GET /anything: status %d, body %s", resp.StatusCode, body)
+	}
+	if resp, body := post(t, url+"/", requestBody, nil); resp.StatusCode != http.StatusNotFound || errorType(t, body) != "not_found_error" {
+		t.Errorf("POST /: status %d, body %s", resp.StatusCode, body)
+	}
+}
+
 func TestCallerLeavingBeforeAnAnswerIsRecordedAs499(t *testing.T) {
 	g, url := streamGateway(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
