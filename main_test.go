@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,12 @@ func testGateway(t *testing.T, upstreamURL string, perMinute int) *gateway {
 	if err != nil {
 		t.Fatal(err)
 	}
+	spend, err := openSpend(filepath.Join(t.TempDir(), "spend.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &gateway{
+		spend: spend, dailyCap: 1000_000_000, // $1,000, out of the way unless a test lowers it
 		upstream: upstreamURL, apiKey: "upstream-key", client: newClient(time.Minute),
 		keys: keys, limiter: newLimiter(perMinute), maxRetries: 2,
 		// Tests do not wait between tries.
@@ -168,7 +174,7 @@ func TestHidesAccountHeadersFromCaller(t *testing.T) {
 		w.Header().Set("Anthropic-Ratelimit-Requests-Remaining", "49")
 		w.Header().Set("Set-Cookie", "a=b")
 		w.Header().Set("Request-Id", "req_1")
-		io.WriteString(w, "{}")
+		io.WriteString(w, `{"model":"claude-haiku-5-5","usage":{"output_tokens":1}}`)
 	}))
 
 	resp, _ := post(t, url+"/v1/messages", requestBody, nil)

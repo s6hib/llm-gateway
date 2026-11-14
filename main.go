@@ -7,6 +7,8 @@
 //	RATE_LIMIT_PER_MINUTE  requests a minute allowed per caller (default 60)
 //	UPSTREAM_TIMEOUT       how long to wait for the upstream to start answering (default 60s)
 //	MAX_RETRIES            extra tries after a failed upstream call (default 2)
+//	DAILY_CAP_USD          dollars each caller may spend per UTC day (default 1)
+//	SPEND_FILE             where the per-caller totals are kept (default spend.json)
 //	UPSTREAM_URL           where requests are forwarded (default https://api.anthropic.com)
 //	ADDR                   where the gateway listens (default 127.0.0.1:8080)
 package main
@@ -32,6 +34,11 @@ import (
 // is held in memory, so this is kept far below what the upstream accepts.
 const maxBody = 10 << 20 // 10 MB
 
+// maxAnswer is the largest upstream answer the gateway will read. An answer
+// is held in memory too, so that its token counts can be read before it is
+// sent on.
+const maxAnswer = 32 << 20 // 32 MB
+
 // hopHeaders describe one connection between two machines. A proxy does not
 // pass them on, because its two connections are separate (RFC 9110, 7.6.1).
 var hopHeaders = []string{
@@ -48,6 +55,9 @@ type gateway struct {
 
 	maxRetries int
 	sleep      func(context.Context, time.Duration) error // swapped out in tests
+
+	spend    *spendStore
+	dailyCap int64 // millionths of a dollar, per caller per UTC day
 }
 
 // newClient returns an HTTP client that gives up on a call when the upstream
@@ -82,6 +92,14 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "this gateway key has used up its requests for now")
 		return
 	}
+	// The cap is checked before the call and the cost is only known after
+	// it, so a caller can end the day over the cap by the calls that were
+	// already under way when it was reached.
+	if spent, resets := g.spend.spentToday(name); spent >= g.dailyCap {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(resets.Seconds())))))
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "this gateway key has reached its daily spending cap")
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
@@ -92,6 +110,23 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "the gateway could not read the request body")
 		return
+	}
+
+	// A streamed answer carries its token counts in a different form, which
+	// the gateway cannot read yet. Letting one through would be spending that
+	// is never counted, so anything that is not plainly "no streaming" is
+	// refused: a body that is not a JSON object, or a stream field, in any
+	// spelling, set to something other than false or null.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "the request body must be a JSON object")
+		return
+	}
+	for field, value := range fields {
+		if strings.EqualFold(field, "stream") && string(value) != "false" && string(value) != "null" {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "the gateway does not support streaming yet")
+			return
+		}
 	}
 
 	resp, err := g.send(r, body)
@@ -110,6 +145,22 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
+	if err != nil || len(answer) > maxAnswer {
+		if r.Context().Err() != nil {
+			return
+		}
+		log.Printf("reading the upstream answer failed: %v (%d bytes read)", err, len(answer))
+		writeError(w, http.StatusBadGateway, "api_error", "the gateway could not read the upstream's answer")
+		return
+	}
+	// A successful answer that cannot be counted is not passed on. Otherwise
+	// any answer the gateway fails to understand would be free to the caller.
+	if resp.StatusCode == http.StatusOK && !g.count(name, answer) {
+		writeError(w, http.StatusBadGateway, "api_error", "the gateway could not read the token counts in the upstream's answer")
+		return
+	}
+
 	copyHeaders(w.Header(), resp.Header)
 	// These describe the account behind the upstream key. Callers are not
 	// shown them.
@@ -120,7 +171,43 @@ func (g *gateway) messages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	w.Write(answer)
+}
+
+// count reads the model and token counts out of a successful answer and adds
+// their cost to the caller's total for the day. It returns false when the
+// answer has no token counts to read.
+func (g *gateway) count(name string, answer []byte) bool {
+	var message struct {
+		Model string `json:"model"`
+		Usage *usage `json:"usage"`
+	}
+	if err := json.Unmarshal(answer, &message); err != nil || message.Usage == nil {
+		log.Printf("caller=%s answer has no usage to count", name)
+		return false
+	}
+	if _, known := priceFor(message.Model); !known {
+		log.Printf("no price for model %q, charging the highest price in the table", message.Model)
+	}
+	micro := cost(message.Model, *message.Usage)
+	if err := g.spend.add(name, *message.Usage, micro); err != nil {
+		log.Printf("saving the spend file failed: %v", err)
+	}
+	log.Printf("caller=%s model=%q prompt_tokens=%d output_tokens=%d cost=$%.6f",
+		name, message.Model, message.Usage.promptTokens(), message.Usage.OutputTokens, float64(micro)/1e6)
+	return true
+}
+
+// parseCap turns DAILY_CAP_USD, a number of dollars, into millionths of a
+// dollar. It has to be at least one millionth and at most a million dollars.
+func parseCap(dollars string) (int64, error) {
+	value, err := strconv.ParseFloat(dollars, 64)
+	// Written as "not in range" so that NaN, which fails every comparison,
+	// is refused too.
+	if err != nil || !(value >= 0.000001 && value <= 1e6) {
+		return 0, errors.New("must be a number of dollars from 0.000001 to 1000000")
+	}
+	return int64(math.Round(value * 1e6)), nil
 }
 
 // attempt makes one upstream call with the caller's request.
@@ -225,6 +312,12 @@ func main() {
 		Addr:              env("ADDR", "127.0.0.1:8080"),
 		Handler:           g.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if g.dailyCap, err = parseCap(env("DAILY_CAP_USD", "1")); err != nil {
+		log.Fatalf("DAILY_CAP_USD %v", err)
+	}
+	if g.spend, err = openSpend(env("SPEND_FILE", "spend.json")); err != nil {
+		log.Fatalf("SPEND_FILE: %v", err)
 	}
 	log.Printf("listening on %s, forwarding to %s", server.Addr, g.upstream)
 	log.Fatal(server.ListenAndServe())
